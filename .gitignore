@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+runtime/world_state.json
+runtime/last_run_report.json
+runtime/live_run_state.json

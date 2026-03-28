@@ -1,0 +1,1115 @@
+"""First real world slice.
+
+Debug-level version:
+- keeps persistent world behavior
+- keeps pressure-aware rematerialization
+- keeps pressure-aware live behavior
+- separates runtime from inspection cost
+
+Debug levels:
+- off   : no overlay, no live speed stats, minimal debug payload
+- basic : chunk overlay only
+- full  : chunk overlay + speed stats + overlay text
+"""
+
+from __future__ import annotations
+
+import queue
+import random
+import threading
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+from engine.components.player_state import PlayerState
+from engine.systems.player_disturbance_system import update_player_disturbance
+from engine.assets.asset_manager import AssetManager
+from engine.components.agent_state import AgentState
+from engine.components.player_tag import PlayerTag
+from engine.components.renderable import Renderable
+from engine.components.transform import Transform
+from engine.components.velocity import Velocity
+from engine.core.ecs import ECS
+from engine.core.fixed_step import run_fixed_step
+from engine.core.flat_world import FlatWorld
+from engine.core.frame_arena import FrameArena
+from engine.core.id_allocator import IDAllocator
+from engine.core.world_chunk import WorldChunk, make_room_chunk
+from engine.core.world_grid import ChunkCoord, WorldGrid
+from engine.render.packet_buffers import PacketBufferPool
+from engine.render.renderer import Renderer
+from engine.systems.activation_system import ActivationState, chunk_sets_debug_dict, update_activation_state
+from engine.systems.agent_wander_system import build_wander_state, update_agent_wander
+from engine.systems.flat_movement_system import update_flat_movement
+from engine.systems.flat_render_extract_system import extract_flat_render_packet
+from engine.systems.flat_sync_system import build_flat_world_from_ecs, write_flat_positions_back_to_ecs
+from engine.systems.player_input_system import apply_player_input
+from engine.systems.simple_collision_system import RectObstacle, WorldBounds, resolve_static_obstacles, resolve_world_bounds
+from engine.world.district_state import DistrictState, pressure_to_district_state
+from engine.world.save_manager import load_chunk_state_into, save_chunk_state
+from engine.world.run_report import save_run_report
+from engine.world.live_run_state import save_live_run_state, clear_live_run_state
+from engine.missions.mission import Mission, build_default_mission
+
+
+EntityID = Tuple[int, int]
+
+
+@dataclass(slots=True)
+class ChunkTelemetry:
+    baseline_civ: float
+    baseline_host: float
+    final_civ: float
+    final_host: float
+    final_pressure: float
+    activation_count: int
+    archetype: str
+
+
+def _poll_keys_pygame() -> dict[str, bool]:
+    try:
+        import pygame
+    except Exception:
+        return {"left": False, "right": False, "up": False, "down": False}
+
+    pygame.event.pump()
+    pressed = pygame.key.get_pressed()
+
+    return {
+        "left": bool(pressed[pygame.K_LEFT] or pressed[pygame.K_a]),
+        "right": bool(pressed[pygame.K_RIGHT] or pressed[pygame.K_d]),
+        "up": bool(pressed[pygame.K_UP] or pressed[pygame.K_w]),
+        "down": bool(pressed[pygame.K_DOWN] or pressed[pygame.K_s]),
+    }
+
+
+def _make_world_chunks(grid: WorldGrid) -> Dict[ChunkCoord, WorldChunk]:
+    chunks: Dict[ChunkCoord, WorldChunk] = {}
+
+    for cy in range(-2, 3):
+        for cx in range(-2, 3):
+            doors = []
+            if cy < 2:
+                doors.append("N")
+            if cy > -2:
+                doors.append("S")
+            if cx > -2:
+                doors.append("W")
+            if cx < 2:
+                doors.append("E")
+
+            if (cx, cy) == (0, 0):
+                archetype = "plaza"
+                tag = "hub"
+                civilians = 8.0
+                hostiles = 0.0
+            elif abs(cx) == 2 or abs(cy) == 2:
+                archetype = "dense"
+                tag = "edge"
+                civilians = 2.0
+                hostiles = 3.0
+            elif cx == 0 or cy == 0:
+                archetype = "lane"
+                tag = "lane"
+                civilians = 4.0
+                hostiles = 1.0
+            else:
+                archetype = "room"
+                tag = "wild"
+                civilians = 3.0
+                hostiles = 1.0
+
+            ox, oy = grid.chunk_to_world_origin((cx, cy))
+            chunks[(cx, cy)] = make_room_chunk(
+                (cx, cy),
+                origin_x=ox,
+                origin_y=oy,
+                width=grid.chunk_width,
+                height=grid.chunk_height,
+                door_mask="".join(doors),
+                civilians=civilians,
+                hostiles=hostiles,
+                seed=(cx * 73856093) ^ (cy * 19349663),
+                tag=tag,
+                archetype=archetype,
+            )
+
+    return chunks
+
+
+def _spawn_chunk_agents(
+    ecs: ECS,
+    chunk: WorldChunk,
+    grid: WorldGrid,
+    assets: AssetManager,
+    *,
+    civilian_mesh: int,
+    civilian_material: int,
+    hostile_mesh: int,
+    hostile_material: int,
+    actor_radius: float,
+) -> List[EntityID]:
+    rng = random.Random(chunk.population.seed + max(0, chunk.state.activation_count))
+    ox, oy = grid.chunk_to_world_origin(chunk.coord)
+    width = grid.chunk_width
+    height = grid.chunk_height
+
+    out: List[EntityID] = []
+
+    civ_count, host_count = chunk.projected_materialization()
+    chunk.note_population_materialized(civ_count, host_count)
+
+    def spawn_group(
+        count: int,
+        *,
+        mesh_handle: int,
+        material_handle: int,
+        speed_scale: float,
+        kind: str,
+    ) -> None:
+        nonlocal out
+        for _ in range(count):
+            x = ox + width * 0.5
+            y = oy + height * 0.5
+
+            for _attempt in range(24):
+                x = rng.uniform(ox + 40.0, ox + width - 40.0)
+                y = rng.uniform(oy + 40.0, oy + height - 40.0)
+
+                blocked = False
+                for rect in chunk.obstacles:
+                    if (
+                        rect.x - actor_radius <= x <= rect.x + rect.w + actor_radius
+                        and rect.y - actor_radius <= y <= rect.y + rect.h + actor_radius
+                    ):
+                        blocked = True
+                        break
+
+                if not blocked:
+                    break
+
+            vx = rng.uniform(-20.0, 20.0) * speed_scale
+            vy = rng.uniform(-20.0, 20.0) * speed_scale
+            entity_id = ecs.create_entity(
+                {
+                    Transform: Transform(position=(x, y)),
+                    Velocity: Velocity(value=(vx, vy)),
+                    Renderable: Renderable(mesh_handle=mesh_handle, material_handle=material_handle),
+                    AgentState: AgentState(
+                        kind=kind,
+                        home_archetype=chunk.archetype,
+                        pressure_bias=min(3.0, float(chunk.state.pressure)),
+                    ),
+                }
+            )
+            out.append(entity_id)
+
+    civ_speed = 0.8 if chunk.archetype == "plaza" else 1.0
+    host_speed = 1.2 if chunk.archetype == "dense" else 1.0
+
+    spawn_group(
+        civ_count,
+        mesh_handle=civilian_mesh,
+        material_handle=civilian_material,
+        speed_scale=civ_speed,
+        kind="civilian",
+    )
+    spawn_group(
+        host_count,
+        mesh_handle=hostile_mesh,
+        material_handle=hostile_material,
+        speed_scale=host_speed,
+        kind="hostile",
+    )
+
+    return out
+
+
+def _active_world_bounds(
+    grid: WorldGrid,
+    active_chunks: set[ChunkCoord],
+    *,
+    pad: float = 24.0,
+) -> WorldBounds:
+    if not active_chunks:
+        return WorldBounds(-256.0, -256.0, 256.0, 256.0)
+
+    min_x = float("inf")
+    min_y = float("inf")
+    max_x = float("-inf")
+    max_y = float("-inf")
+
+    for coord in active_chunks:
+        cx0, cy0, cx1, cy1 = grid.chunk_bounds(coord)
+        if cx0 < min_x:
+            min_x = cx0
+        if cy0 < min_y:
+            min_y = cy0
+        if cx1 > max_x:
+            max_x = cx1
+        if cy1 > max_y:
+            max_y = cy1
+
+    return WorldBounds(min_x - pad, min_y - pad, max_x + pad, max_y + pad)
+
+
+def _autopilot_keys(
+    player_x: float,
+    player_y: float,
+    grid: WorldGrid,
+    mission: Mission,
+) -> dict[str, bool]:
+    target_coord = mission.target if mission.picked_up else mission.source
+    ox, oy = grid.chunk_to_world_origin(target_coord)
+    tx = ox + grid.chunk_width * 0.5
+    ty = oy + grid.chunk_height * 0.5
+
+    dx = tx - player_x
+    dy = ty - player_y
+
+    deadzone = 18.0
+
+    return {
+        "left": dx < -deadzone,
+        "right": dx > deadzone,
+        "up": dy > deadzone,
+        "down": dy < -deadzone,
+    }
+
+
+def run_world_slice(
+    duration: float = 10.0,
+    seed: int = 0,
+    fps: float = 60.0,
+    use_graphics: bool = True,
+    player_speed: float = 150.0,
+    *,
+    use_autopilot: bool | None = None,
+    chunk_width: float = 256.0,
+    chunk_height: float = 256.0,
+    active_radius: int = 1,
+    warm_radius: int = 2,
+    debug_level: str = "basic",
+    save_path: str = "runtime/world_state.json",
+    report_path: str | None = "runtime/last_run_report.json",
+    live_state_path: str | None = "runtime/live_run_state.json",
+    mission: Mission | None = None,
+) -> Dict[Tuple[int, int], Tuple[float, float]]:
+    random.seed(seed)
+
+    if use_autopilot is None:
+        use_autopilot = True
+
+    if debug_level not in {"off", "basic", "full"}:
+        debug_level = "basic"
+
+    id_alloc = IDAllocator()
+    ecs = ECS(id_alloc)
+    arena = FrameArena()
+    assets = AssetManager()
+
+    grid = WorldGrid(chunk_width=chunk_width, chunk_height=chunk_height)
+    chunks = _make_world_chunks(grid)
+    for chunk in chunks.values():
+        chunk.district_state = pressure_to_district_state(chunk.state.pressure).value
+
+    loaded_chunk_count = load_chunk_state_into(chunks, save_path)
+    for chunk in chunks.values():
+        chunk.district_state = pressure_to_district_state(chunk.state.pressure).value
+
+    active_mission = mission if mission is not None else build_default_mission(chunks)
+
+    player_mesh = assets.create_asset("player_mesh")
+    player_material = assets.create_asset("player_material")
+    civilian_mesh = assets.create_asset("civilian_mesh")
+    civilian_material = assets.create_asset("civilian_material")
+    hostile_mesh = assets.create_asset("hostile_mesh")
+    hostile_material = assets.create_asset("hostile_material")
+
+    actor_radius = 8.0
+
+    player_id = ecs.create_entity(
+        {
+            Transform: Transform(position=(chunk_width * 0.5, chunk_height * 0.5)),
+            Velocity: Velocity(value=(0.0, 0.0)),
+            Renderable: Renderable(mesh_handle=player_mesh, material_handle=player_material),
+            PlayerTag: PlayerTag(),
+            PlayerState: PlayerState(),
+        }
+    )
+
+    activation = ActivationState()
+    update_activation_state(
+        activation,
+        grid,
+        chunk_width * 0.5,
+        chunk_height * 0.5,
+        active_radius=active_radius,
+        warm_radius=warm_radius,
+    )
+
+    chunk_telemetry_start: Dict[ChunkCoord, tuple[float, float]] = {
+        coord: (chunk.population.channels.civilians, chunk.population.channels.hostiles)
+        for coord, chunk in chunks.items()
+    }
+
+    chunk_entities: Dict[ChunkCoord, List[EntityID]] = {}
+    for coord in activation.active_chunks:
+        chunk = chunks.get(coord)
+        if chunk is None:
+            continue
+        chunk.on_activate(0)
+        chunk_entities[coord] = _spawn_chunk_agents(
+            ecs,
+            chunk,
+            grid,
+            assets,
+            civilian_mesh=civilian_mesh,
+            civilian_material=civilian_material,
+            hostile_mesh=hostile_mesh,
+            hostile_material=hostile_material,
+            actor_radius=actor_radius,
+        )
+
+    world = FlatWorld()
+    build_flat_world_from_ecs(ecs, world)
+    wander_state = build_wander_state(world, ecs)
+
+    packet_queue: queue.Queue = queue.Queue(maxsize=3)
+    stop_event = threading.Event()
+    packet_pool = PacketBufferPool(count=3)
+
+    renderer = Renderer()
+    renderer.start(packet_queue, stop_event, use_graphics=use_graphics, packet_pool=packet_pool)
+
+    tick_count = 0
+    tick_total = 0.0
+    tick_max = 0.0
+    last_live_state_second = -1
+
+    input_total = 0.0
+    input_max = 0.0
+
+    activation_total = 0.0
+    activation_max = 0.0
+
+    wander_total = 0.0
+    wander_max = 0.0
+
+    movement_total = 0.0
+    movement_max = 0.0
+
+    collision_total = 0.0
+    collision_max = 0.0
+
+    extract_total = 0.0
+    extract_max = 0.0
+
+    enqueue_total = 0.0
+    enqueue_max = 0.0
+
+    budget_ms = 1000.0 / fps
+    hitch_16 = 0
+    hitch_20 = 0
+    hitch_33 = 0
+
+    total_spawned = sum(len(v) for v in chunk_entities.values())
+    total_dissolved = 0
+    activation_events = 0
+    last_trace_second = -1
+
+    speed_sample_interval = 15
+    cached_civ_avg_speed = 0.0
+    cached_host_avg_speed = 0.0
+    cached_player_band = "calm"
+    cached_player_pressure = 0.0
+    cached_player_strain = 0.0
+    cached_player_archetype = "none"
+    cached_player_overloaded = False
+    cached_player_survival_state = "stable"
+    cached_last_state_changes: list[str] = []
+    district_transition_count = 0
+
+    cached_player_chunk = None
+    cached_mission_label = active_mission.label
+    cached_mission_phase = active_mission.phase
+    cached_mission_cargo = active_mission.cargo_type.value
+    cached_mission_source = active_mission.source
+    cached_mission_target = active_mission.target
+    cached_mission_completed = False
+    cached_mission_failed = False
+    cached_mission_failure_reason = ""
+    cached_objective_text = "Reach pickup"
+
+    def _rebuild_active_runtime() -> None:
+        nonlocal world, wander_state
+        build_flat_world_from_ecs(ecs, world)
+        wander_state = build_wander_state(world, ecs)
+
+    def _apply_background_drift() -> None:
+        for coord, chunk in chunks.items():
+            if coord not in activation.warm_chunks:
+                chunk.apply_passive_drift()
+
+    def _update_district_states() -> list[str]:
+        changes: list[str] = []
+        for coord, chunk in chunks.items():
+            prev = chunk.district_state
+            curr = pressure_to_district_state(chunk.state.pressure).value
+            if curr != prev:
+                chunk.district_state = curr
+                changes.append(f"{coord}:{prev}->{curr}")
+            else:
+                chunk.district_state = curr
+        return changes
+
+    def _count_explicit_population() -> tuple[int, int]:
+        civ = 0
+        host = 0
+        for entity_id in world.index_to_entity:
+            if entity_id == player_id:
+                continue
+            agent_state = ecs.get_component(entity_id, AgentState)
+            if agent_state is None:
+                continue
+            if agent_state.kind == "hostile":
+                host += 1
+            else:
+                civ += 1
+        return civ, host
+
+    def _count_active_abstract_population() -> tuple[int, int]:
+        civ = 0
+        host = 0
+        for coord in activation.active_chunks:
+            chunk = chunks.get(coord)
+            if chunk is None:
+                continue
+            civ += chunk.civilian_count_hint()
+            host += chunk.hostile_count_hint()
+        return civ, host
+
+    def _average_live_speeds() -> tuple[float, float]:
+        civ_total = 0.0
+        civ_count = 0
+        host_total = 0.0
+        host_count = 0
+
+        for entity_id in world.index_to_entity:
+            if entity_id == player_id:
+                continue
+            agent_state = ecs.get_component(entity_id, AgentState)
+            if agent_state is None:
+                continue
+            idx = world.entity_to_index[entity_id]
+            vx = world.vel_x[idx]
+            vy = world.vel_y[idx]
+            speed = (vx * vx + vy * vy) ** 0.5
+
+            if agent_state.kind == "hostile":
+                host_total += speed
+                host_count += 1
+            else:
+                civ_total += speed
+                civ_count += 1
+
+        civ_avg = civ_total / civ_count if civ_count else 0.0
+        host_avg = host_total / host_count if host_count else 0.0
+        return civ_avg, host_avg
+
+    def _build_chunk_overlay() -> list[dict[str, object]]:
+        overlay: list[dict[str, object]] = []
+        for coord, chunk in chunks.items():
+            x0, y0, x1, y1 = grid.chunk_bounds(coord)
+            overlay.append(
+                {
+                    "coord": coord,
+                    "x": x0,
+                    "y": y0,
+                    "w": x1 - x0,
+                    "h": y1 - y0,
+                    "pressure": float(chunk.state.pressure),
+                    "active": coord in activation.active_chunks,
+                    "archetype": chunk.archetype,
+                    "district_state": chunk.district_state,
+                }
+            )
+        return overlay
+
+    def update_fn(tick: int, dt: float) -> None:
+        nonlocal tick_count, tick_total, tick_max
+        nonlocal last_live_state_second
+        nonlocal input_total, input_max
+        nonlocal activation_total, activation_max
+        nonlocal wander_total, wander_max
+        nonlocal movement_total, movement_max
+        nonlocal collision_total, collision_max
+        nonlocal extract_total, extract_max
+        nonlocal enqueue_total, enqueue_max
+        nonlocal hitch_16, hitch_20, hitch_33
+        nonlocal total_spawned, total_dissolved, activation_events, last_trace_second
+        nonlocal cached_civ_avg_speed, cached_host_avg_speed
+        nonlocal cached_player_band, cached_player_pressure
+        nonlocal cached_player_strain, cached_player_archetype, cached_player_overloaded
+        nonlocal cached_player_survival_state
+        nonlocal cached_last_state_changes, district_transition_count
+        nonlocal cached_player_chunk
+        nonlocal cached_mission_label, cached_mission_phase, cached_mission_cargo
+        nonlocal cached_mission_source, cached_mission_target
+        nonlocal cached_mission_completed, cached_mission_failed, cached_mission_failure_reason
+        nonlocal cached_objective_text
+
+        tick_start = time.perf_counter()
+
+        input_start = time.perf_counter()
+        ptransform_for_input = ecs.get_component(player_id, Transform)
+        if ptransform_for_input is not None:
+            input_px, input_py = ptransform_for_input.position
+        else:
+            input_px, input_py = (chunk_width * 0.5, chunk_height * 0.5)
+
+        if use_autopilot:
+            keys = _autopilot_keys(input_px, input_py, grid, active_mission)
+        else:
+            keys = _poll_keys_pygame() if use_graphics else {
+                "left": False,
+                "right": False,
+                "up": False,
+                "down": False,
+            }
+        apply_player_input(ecs, keys, speed=player_speed)
+        input_elapsed = time.perf_counter() - input_start
+        input_total += input_elapsed
+        input_max = max(input_max, input_elapsed)
+
+        if world.has(player_id):
+            pidx = world.entity_to_index[player_id]
+            pvel = ecs.get_component(player_id, Velocity)
+            if pvel is not None:
+                world.vel_x[pidx] = pvel.value[0]
+                world.vel_y[pidx] = pvel.value[1]
+
+        wander_start = time.perf_counter()
+        active_obstacles: List[RectObstacle] = []
+        defined_active_chunks = 0
+        for coord in activation.active_chunks:
+            chunk = chunks.get(coord)
+            if chunk is not None:
+                defined_active_chunks += 1
+                active_obstacles.extend(chunk.obstacles)
+
+        active_bounds = _active_world_bounds(grid, activation.active_chunks)
+
+        update_agent_wander(
+            ecs,
+            world,
+            wander_state,
+            dt,
+            obstacles=active_obstacles,
+            bounds=active_bounds,
+        )
+        wander_elapsed = time.perf_counter() - wander_start
+        wander_total += wander_elapsed
+        wander_max = max(wander_max, wander_elapsed)
+
+        move_start = time.perf_counter()
+        update_flat_movement(world, dt)
+        move_elapsed = time.perf_counter() - move_start
+        movement_total += move_elapsed
+        movement_max = max(movement_max, move_elapsed)
+
+        collision_start = time.perf_counter()
+        resolve_world_bounds(world, radius=actor_radius, bounds=active_bounds)
+        resolve_static_obstacles(world, radius=actor_radius, obstacles=active_obstacles)
+        collision_elapsed = time.perf_counter() - collision_start
+        collision_total += collision_elapsed
+        collision_max = max(collision_max, collision_elapsed)
+
+        pidx = world.entity_to_index[player_id]
+        player_x = world.pos_x[pidx]
+        player_y = world.pos_y[pidx]
+        ptransform = ecs.get_component(player_id, Transform)
+        if ptransform is not None:
+            ptransform.position = (player_x, player_y)
+
+        disturbance = update_player_disturbance(
+            ecs,
+            chunks,
+            grid,
+            dt=dt,
+        )
+        cached_player_chunk = disturbance["chunk"]
+        cached_player_band = str(disturbance["band"])
+        cached_player_pressure = float(disturbance["pressure"])
+        cached_player_strain = float(disturbance["strain"])
+        cached_player_archetype = str(disturbance["archetype"])
+        cached_player_overloaded = bool(disturbance["overloaded"])
+        cached_player_survival_state = str(disturbance["survival_state"])
+
+        active_mission.observe(cached_player_chunk, overloaded=cached_player_overloaded)
+        cached_mission_phase = active_mission.phase
+        cached_mission_completed = active_mission.completed
+        cached_mission_failed = active_mission.failed
+        cached_mission_failure_reason = active_mission.failure_reason
+
+        if active_mission.picked_up and not active_mission.delivered:
+            cached_objective_text = "Deliver to safe district"
+        elif active_mission.delivered:
+            cached_objective_text = "Stay alive until run ends"
+        else:
+            cached_objective_text = "Reach pickup"
+
+        activation_start = time.perf_counter()
+        update_activation_state(
+            activation,
+            grid,
+            player_x,
+            player_y,
+            active_radius=active_radius,
+            warm_radius=warm_radius,
+        )
+
+        runtime_changed = False
+        entered_now = sorted(activation.entered_active)
+        exited_now = sorted(activation.exited_active)
+        if entered_now or exited_now:
+            activation_events += 1
+            print(f"[world] transition +a={entered_now} -a={exited_now}")
+
+        for coord in activation.exited_active:
+            chunk = chunks.get(coord)
+            if chunk is not None:
+                chunk.on_deactivate()
+
+            entity_ids = chunk_entities.pop(coord, [])
+            returned_civ = 0
+            returned_host = 0
+
+            for entity_id in entity_ids:
+                if world.has(entity_id):
+                    world.remove(entity_id)
+
+                agent_state = ecs.get_component(entity_id, AgentState)
+                if agent_state is not None:
+                    if agent_state.kind == "hostile":
+                        returned_host += 1
+                    else:
+                        returned_civ += 1
+
+                try:
+                    ecs.destroy_entity(entity_id)
+                    total_dissolved += 1
+                    runtime_changed = True
+                except KeyError:
+                    pass
+
+            if chunk is not None and (returned_civ or returned_host):
+                chunk.note_population_returned(returned_civ, returned_host)
+
+        for coord in activation.entered_active:
+            chunk = chunks.get(coord)
+            if chunk is None:
+                continue
+            chunk.on_activate(tick)
+            entity_ids = _spawn_chunk_agents(
+                ecs,
+                chunk,
+                grid,
+                assets,
+                civilian_mesh=civilian_mesh,
+                civilian_material=civilian_material,
+                hostile_mesh=hostile_mesh,
+                hostile_material=hostile_material,
+                actor_radius=actor_radius,
+            )
+            if entity_ids:
+                chunk_entities[coord] = entity_ids
+                total_spawned += len(entity_ids)
+                runtime_changed = True
+
+        _apply_background_drift()
+
+        state_changes = _update_district_states()
+        if state_changes:
+            district_transition_count += len(state_changes)
+            cached_last_state_changes = state_changes[:3]
+            print(f"[district] transitions={cached_last_state_changes}")
+        else:
+            cached_last_state_changes = []
+
+        if runtime_changed:
+            _rebuild_active_runtime()
+            pidx = world.entity_to_index[player_id]
+            player_x = world.pos_x[pidx]
+            player_y = world.pos_y[pidx]
+
+        activation_elapsed = time.perf_counter() - activation_start
+        activation_total += activation_elapsed
+        activation_max = max(activation_max, activation_elapsed)
+
+        current_second = int(tick / fps)
+        if live_state_path is not None and current_second != last_live_state_second:
+            last_live_state_second = current_second
+
+            save_live_run_state(
+                {
+                    "time_s": current_second,
+                    "mission": {
+                        "label": cached_mission_label,
+                        "cargo": cached_mission_cargo,
+                        "phase": cached_mission_phase,
+                        "source": list(cached_mission_source),
+                        "target": list(cached_mission_target),
+                        "picked_up": active_mission.picked_up,
+                        "delivered": active_mission.delivered,
+                    },
+                    "player": {
+                        "chunk": list(cached_player_chunk) if cached_player_chunk is not None else None,
+                        "zone_archetype": cached_player_archetype,
+                        "zone_band": cached_player_band,
+                        "local_pressure": cached_player_pressure,
+                        "strain": cached_player_strain,
+                        "survival_state": cached_player_survival_state,
+                        "overloaded": cached_player_overloaded,
+                    },
+                    "objective_text": cached_objective_text,
+                },
+                live_state_path,
+            )
+
+        if current_second != last_trace_second:
+            last_trace_second = current_second
+            dbg = chunk_sets_debug_dict(activation)
+            explicit_civ, explicit_host = _count_explicit_population()
+            abstract_civ, abstract_host = _count_active_abstract_population()
+            pressure_total = 0.0
+            for coord in activation.active_chunks:
+                chunk = chunks.get(coord)
+                if chunk is not None:
+                    pressure_total += chunk.state.pressure
+            print(
+                f"[world] t={current_second:02d}s "
+                f"center={dbg['center_chunk']} "
+                f"active={dbg['active_count']} "
+                f"defined={defined_active_chunks} "
+                f"explicit_civ={explicit_civ} "
+                f"explicit_host={explicit_host} "
+                f"abstract_civ={abstract_civ} "
+                f"abstract_host={abstract_host} "
+                f"pressure={pressure_total:.2f} "
+                f"entities={ecs.rows()}"
+            )
+
+        if debug_level == "full" and tick % speed_sample_interval == 0:
+            cached_civ_avg_speed, cached_host_avg_speed = _average_live_speeds()
+
+        packet = packet_pool.acquire()
+        extract_start = time.perf_counter()
+        packet = extract_flat_render_packet(world, packet)
+        packet["camera_x"] = player_x
+        packet["camera_y"] = player_y
+        packet["obstacles"] = [(o.x, o.y, o.w, o.h) for o in active_obstacles]
+        packet["player_mesh"] = player_mesh
+        packet["hostile_mesh"] = hostile_mesh
+        packet["bounds"] = (active_bounds.min_x, active_bounds.min_y, active_bounds.max_x, active_bounds.max_y)
+        packet["debug_player_rings"] = False
+        packet["hud"] = {
+            "objective": cached_objective_text,
+            "mission_label": cached_mission_label,
+            "mission_phase": cached_mission_phase,
+            "cargo": cached_mission_cargo,
+            "source": cached_mission_source,
+            "target": cached_mission_target,
+            "player_chunk": cached_player_chunk,
+            "zone_archetype": cached_player_archetype,
+            "zone_band": cached_player_band,
+            "local_pressure": cached_player_pressure,
+            "strain": cached_player_strain,
+            "survival_state": cached_player_survival_state,
+            "overloaded": cached_player_overloaded,
+            "picked_up": active_mission.picked_up,
+            "delivered": active_mission.delivered,
+        }
+
+        if debug_level in {"basic", "full"}:
+            packet["chunk_overlay"] = _build_chunk_overlay()
+        else:
+            packet["chunk_overlay"] = []
+
+        if debug_level == "full":
+            packet["overlay_lines"] = [
+                f"center={activation.center_chunk}",
+                f"active={len(activation.active_chunks)} warm={len(activation.warm_chunks)}",
+                f"spawned={total_spawned} dissolved={total_dissolved}",
+                f"zone={cached_player_archetype}:{cached_player_band}",
+                f"local_pressure={cached_player_pressure:.2f}",
+                f"strain={cached_player_strain:.1f}",
+                f"state={cached_player_survival_state}",
+                f"mission={cached_mission_phase}",
+                f"cargo={cached_mission_cargo}",
+                f"route={cached_mission_source}->{cached_mission_target}",
+                f"district_changes={','.join(cached_last_state_changes) if cached_last_state_changes else 'none'}",
+                f"overloaded={cached_player_overloaded}",
+            ]
+        elif debug_level == "basic":
+            packet["overlay_lines"] = [
+                f"center={activation.center_chunk}",
+                f"active={len(activation.active_chunks)} warm={len(activation.warm_chunks)}",
+                f"spawned={total_spawned} dissolved={total_dissolved}",
+            ]
+        else:
+            packet["overlay_lines"] = []
+
+        extract_elapsed = time.perf_counter() - extract_start
+        extract_total += extract_elapsed
+        extract_max = max(extract_max, extract_elapsed)
+
+        enqueue_start = time.perf_counter()
+        try:
+            packet_queue.put_nowait(packet)
+        except queue.Full:
+            packet_pool.release(packet)
+        enqueue_elapsed = time.perf_counter() - enqueue_start
+        enqueue_total += enqueue_elapsed
+        enqueue_max = max(enqueue_max, enqueue_elapsed)
+
+        arena.clear()
+
+        tick_elapsed = time.perf_counter() - tick_start
+        tick_total += tick_elapsed
+        tick_max = max(tick_max, tick_elapsed)
+
+        tick_ms = tick_elapsed * 1000.0
+        if tick_ms > budget_ms:
+            hitch_16 += 1
+        if tick_ms > 20.0:
+            hitch_20 += 1
+        if tick_ms > 33.33:
+            hitch_33 += 1
+
+        tick_count += 1
+
+    run_fixed_step(fps, update_fn, duration=duration)
+
+    stop_event.set()
+    renderer.stop()
+    write_flat_positions_back_to_ecs(ecs, world)
+
+    if live_state_path is not None:
+        clear_live_run_state(live_state_path)
+
+    # Rehydrate any still-active chunk populations before saving.
+    # current_channels is the abstract reserve after materialization,
+    # so if we save while agents are still live in ECS, the save will hollow the city out.
+    for coord, entity_ids in chunk_entities.items():
+        chunk = chunks.get(coord)
+        if chunk is None:
+            continue
+
+        returned_civ = 0
+        returned_host = 0
+
+        for entity_id in entity_ids:
+            agent_state = ecs.get_component(entity_id, AgentState)
+            if agent_state is None:
+                continue
+            if agent_state.kind == "hostile":
+                returned_host += 1
+            else:
+                returned_civ += 1
+
+        if returned_civ or returned_host:
+            chunk.note_population_returned(returned_civ, returned_host)
+
+    save_chunk_state(chunks, save_path)
+
+    active_mission.finalize(overloaded=cached_player_overloaded)
+    cached_mission_phase = active_mission.phase
+    cached_mission_completed = active_mission.completed
+    cached_mission_failed = active_mission.failed
+    cached_mission_failure_reason = active_mission.failure_reason
+
+    dbg = chunk_sets_debug_dict(activation)
+    defined_final = sum(1 for coord in activation.active_chunks if coord in chunks)
+
+    final_explicit_civ, final_explicit_host = _count_explicit_population()
+    final_abstract_civ, final_abstract_host = _count_active_abstract_population()
+
+    final_civ_avg_speed = 0.0
+    final_host_avg_speed = 0.0
+    if debug_level == "full":
+        final_civ_avg_speed, final_host_avg_speed = _average_live_speeds()
+
+    final_pressure = 0.0
+    archetypes_in_active: Dict[str, int] = {}
+    for coord in activation.active_chunks:
+        chunk = chunks.get(coord)
+        if chunk is None:
+            continue
+        final_pressure += chunk.state.pressure
+        archetypes_in_active[chunk.archetype] = archetypes_in_active.get(chunk.archetype, 0) + 1
+
+    total_pressure = sum(chunk.state.pressure for chunk in chunks.values())
+
+    telemetry: Dict[ChunkCoord, ChunkTelemetry] = {}
+    for coord, chunk in chunks.items():
+        baseline_civ, baseline_host = chunk_telemetry_start[coord]
+        telemetry[coord] = ChunkTelemetry(
+            baseline_civ=baseline_civ,
+            baseline_host=baseline_host,
+            final_civ=chunk.state.current_channels.civilians,
+            final_host=chunk.state.current_channels.hostiles,
+            final_pressure=chunk.state.pressure,
+            activation_count=chunk.state.activation_count,
+            archetype=chunk.archetype,
+        )
+
+    hottest = sorted(telemetry.items(), key=lambda item: item[1].final_pressure, reverse=True)[:5]
+    hostile_growth = sorted(telemetry.items(), key=lambda item: item[1].final_host - item[1].baseline_host, reverse=True)[:5]
+    civilian_loss = sorted(telemetry.items(), key=lambda item: item[1].baseline_civ - item[1].final_civ, reverse=True)[:5]
+    most_activated = sorted(telemetry.items(), key=lambda item: item[1].activation_count, reverse=True)[:5]
+
+    print("=== World Slice Timing Summary ===")
+    print(f"ticks: {tick_count}")
+    print(f"avg tick: {(tick_total / tick_count) * 1000.0:.4f} ms")
+    print(f"max tick: {tick_max * 1000.0:.4f} ms")
+    print(f"avg input: {(input_total / tick_count) * 1000.0:.4f} ms")
+    print(f"max input: {input_max * 1000.0:.4f} ms")
+    print(f"avg activation: {(activation_total / tick_count) * 1000.0:.4f} ms")
+    print(f"max activation: {activation_max * 1000.0:.4f} ms")
+    print(f"avg wander: {(wander_total / tick_count) * 1000.0:.4f} ms")
+    print(f"max wander: {wander_max * 1000.0:.4f} ms")
+    print(f"avg movement: {(movement_total / tick_count) * 1000.0:.4f} ms")
+    print(f"max movement: {movement_max * 1000.0:.4f} ms")
+    print(f"avg collision: {(collision_total / tick_count) * 1000.0:.4f} ms")
+    print(f"max collision: {collision_max * 1000.0:.4f} ms")
+    print(f"avg extract: {(extract_total / tick_count) * 1000.0:.4f} ms")
+    print(f"max extract: {extract_max * 1000.0:.4f} ms")
+    print(f"avg enqueue: {(enqueue_total / tick_count) * 1000.0:.4f} ms")
+    print(f"max enqueue: {enqueue_max * 1000.0:.4f} ms")
+
+    print("=== World Slice Hitch Summary ===")
+    print(f">{budget_ms:.2f} ms: {hitch_16}")
+    print(f">20.00 ms: {hitch_20}")
+    print(f">33.33 ms: {hitch_33}")
+
+    print("=== World Slice Activation Summary ===")
+    print(f"center_chunk: {dbg['center_chunk']}")
+    print(f"active_chunks: {dbg['active_count']}")
+    print(f"defined_active_chunks: {defined_final}")
+    print(f"warm_chunks: {dbg['warm_count']}")
+    print(f"entered_active(last): {dbg['entered_active']}")
+    print(f"exited_active(last): {dbg['exited_active']}")
+    print(f"activation_events: {activation_events}")
+    print(f"autopilot: {use_autopilot}")
+    print(f"debug_level: {debug_level}")
+
+    print("=== World Slice Population Summary ===")
+    print(f"explicit active civilians: {final_explicit_civ}")
+    print(f"explicit active hostiles: {final_explicit_host}")
+    print(f"abstract civilians in active chunks: {final_abstract_civ}")
+    print(f"abstract hostiles in active chunks: {final_abstract_host}")
+    print(f"active pressure: {final_pressure:.2f}")
+    print(f"active archetypes: {archetypes_in_active}")
+    print(f"player zone archetype: {cached_player_archetype}")
+    print(f"player zone band: {cached_player_band}")
+    print(f"player local pressure: {cached_player_pressure:.3f}")
+    print(f"player strain: {cached_player_strain:.3f}")
+    print(f"player survival state: {cached_player_survival_state}")
+    print(f"player overloaded: {cached_player_overloaded}")
+    if debug_level == "full":
+        print(f"avg civilian speed: {final_civ_avg_speed:.3f}")
+        print(f"avg hostile speed: {final_host_avg_speed:.3f}")
+
+    state_counts: Dict[str, int] = {}
+    for chunk in chunks.values():
+        state_counts[chunk.district_state] = state_counts.get(chunk.district_state, 0) + 1
+
+    print("=== Mission Summary ===")
+    print(f"mission label: {cached_mission_label}")
+    print(f"mission cargo: {cached_mission_cargo}")
+    print(f"mission source: {cached_mission_source}")
+    print(f"mission target: {cached_mission_target}")
+    print(f"mission phase: {cached_mission_phase}")
+    print(f"mission completed: {cached_mission_completed}")
+    print(f"mission failed: {cached_mission_failed}")
+    print(f"mission failure reason: {cached_mission_failure_reason or 'none'}")
+
+    print("=== World Slice Persistent Summary ===")
+    print(f"world pressure total: {total_pressure:.2f}")
+    print("chunk activations total:", sum(chunk.state.activation_count for chunk in chunks.values()))
+    print(f"district transition count: {district_transition_count}")
+    print(f"district state counts: {state_counts}")
+    print(f"save path: {save_path}")
+    print(f"loaded chunk count: {loaded_chunk_count}")
+
+    print("=== World Telemetry ===")
+    print(
+        "top pressure chunks:",
+        [(coord, round(t.final_pressure, 3), t.archetype) for coord, t in hottest if t.final_pressure > 0.0],
+    )
+    print(
+        "top hostile growth:",
+        [(coord, round(t.final_host - t.baseline_host, 3), t.archetype) for coord, t in hostile_growth if (t.final_host - t.baseline_host) > 0.0],
+    )
+    print(
+        "top civilian loss:",
+        [(coord, round(t.baseline_civ - t.final_civ, 3), t.archetype) for coord, t in civilian_loss if (t.baseline_civ - t.final_civ) > 0.0],
+    )
+    print(
+        "most activated chunks:",
+        [(coord, t.activation_count, t.archetype) for coord, t in most_activated if t.activation_count > 0],
+    )
+
+    edge_dense = chunks[(2, 0)]
+    hub = chunks[(0, 0)]
+    print(
+        "sample persistent states:",
+        {
+            "hub_pressure": round(hub.state.pressure, 3),
+            "hub_civ": round(hub.state.current_channels.civilians, 3),
+            "hub_host": round(hub.state.current_channels.hostiles, 3),
+            "edge_pressure": round(edge_dense.state.pressure, 3),
+            "edge_civ": round(edge_dense.state.current_channels.civilians, 3),
+            "edge_host": round(edge_dense.state.current_channels.hostiles, 3),
+        },
+    )
+
+    print("=== World Slice World Summary ===")
+    print(f"active entities: {ecs.rows()}")
+    print(f"total spawned: {total_spawned}")
+    print(f"total dissolved: {total_dissolved}")
+    print(f"tracked active chunks: {len(chunk_entities)}")
+    print(f"defined chunks total: {len(chunks)}")
+
+    if report_path is not None:
+        run_report = {
+            "mission": {
+                "label": cached_mission_label,
+                "cargo": cached_mission_cargo,
+                "source": list(cached_mission_source),
+                "target": list(cached_mission_target),
+                "phase": cached_mission_phase,
+                "completed": cached_mission_completed,
+                "failed": cached_mission_failed,
+                "failure_reason": cached_mission_failure_reason or "none",
+            },
+            "player": {
+                "zone_archetype": cached_player_archetype,
+                "zone_band": cached_player_band,
+                "local_pressure": cached_player_pressure,
+                "strain": cached_player_strain,
+                "survival_state": cached_player_survival_state,
+                "overloaded": cached_player_overloaded,
+            },
+            "world": {
+                "world_pressure_total": total_pressure,
+                "district_transition_count": district_transition_count,
+                "district_state_counts": state_counts,
+                "active_pressure": final_pressure,
+                "active_archetypes": archetypes_in_active,
+                "loaded_chunk_count": loaded_chunk_count,
+            },
+        }
+        save_run_report(run_report, report_path)
+
+    return ecs.snapshot_positions()
