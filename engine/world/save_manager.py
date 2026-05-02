@@ -36,6 +36,8 @@ def save_chunk_state(
             "pressure": float(chunk.state.pressure),
             "district_state": str(chunk.district_state),
             "activation_count": int(chunk.state.activation_count),
+            "anchor_strength": float(chunk.state.anchor_strength),
+            "anchor_certified": bool(chunk.state.anchor_certified),
             "last_active_tick": int(chunk.state.last_active_tick),
             "current_civilians": float(chunk.state.current_channels.civilians),
             "current_hostiles": float(chunk.state.current_channels.hostiles),
@@ -77,6 +79,8 @@ def load_chunk_state_into(
         chunk.state.pressure = max(0.0, float(payload.get("pressure", 0.0)))
         chunk.district_state = str(payload.get("district_state", "clear"))
         chunk.state.activation_count = max(0, int(payload.get("activation_count", 0)))
+        chunk.state.anchor_strength = float(payload.get("anchor_strength", 0.0))
+        chunk.state.anchor_certified = bool(payload.get("anchor_certified", False))
         chunk.state.last_active_tick = int(payload.get("last_active_tick", -1))
         chunk.state.current_channels.civilians = max(
             0.0, float(payload.get("current_civilians", 0.0))

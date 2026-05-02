@@ -5,7 +5,7 @@ Pressure-aware version:
 - keeps timer-based headings
 - uses cheap bounds and obstacle steering
 - behavior is affected by kind, archetype, and pressure bias
-- stays lean enough for the live slice
+- hostiles can enter district-driven response modes
 """
 
 from __future__ import annotations
@@ -157,9 +157,6 @@ def _behavior_profile_codes(
         obstacle_push *= 1.05
         bounds_push *= 1.05
 
-    # Small bounded pressure effect.
-    # Civilians get more hesitant under pressure.
-    # Hostiles get more direct and faster under pressure.
     p = pressure_bias
     if kind_code == KIND_CIVILIAN:
         speed *= max(0.72, 1.0 - 0.10 * p)
@@ -174,19 +171,23 @@ def _behavior_profile_codes(
     return speed, jitter, avoid_margin, obstacle_push, bounds_push
 
 
-def build_wander_state(world: FlatWorld, ecs: ECS) -> Dict[EntityID, dict[str, float | int]]:
-    state: Dict[EntityID, dict[str, float | int]] = {}
+def build_wander_state(world: FlatWorld, ecs: ECS) -> Dict[EntityID, dict[str, float | int | str]]:
+    state: Dict[EntityID, dict[str, float | int | str]] = {}
 
     for entity_id in world.index_to_entity:
         agent_state = ecs.get_component(entity_id, AgentState)
         kind_code = KIND_CIVILIAN
         arch_code = ARCH_ROOM
         pressure_bias = 0.0
+        response_mode = "ambient"
+        response_strength = 0.0
 
         if agent_state is not None:
             kind_code = _kind_code(agent_state.kind)
             arch_code = _arch_code(agent_state.home_archetype)
             pressure_bias = agent_state.pressure_bias
+            response_mode = agent_state.response_mode
+            response_strength = agent_state.response_strength
 
         state[entity_id] = {
             "timer": random.uniform(0.2, 1.0),
@@ -195,6 +196,8 @@ def build_wander_state(world: FlatWorld, ecs: ECS) -> Dict[EntityID, dict[str, f
             "kind_code": kind_code,
             "arch_code": arch_code,
             "pressure_bias": pressure_bias,
+            "response_mode": response_mode,
+            "response_strength": response_strength,
         }
 
     return state
@@ -203,13 +206,14 @@ def build_wander_state(world: FlatWorld, ecs: ECS) -> Dict[EntityID, dict[str, f
 def update_agent_wander(
     ecs: ECS,
     world: FlatWorld,
-    wander_state: Dict[EntityID, dict[str, float | int]],
+    wander_state: Dict[EntityID, dict[str, float | int | str]],
     dt: float,
     *,
     turn_interval_min: float = 0.4,
     turn_interval_max: float = 1.8,
     obstacles: Iterable[RectObstacle] = (),
     bounds: WorldBounds | None = None,
+    player_pos: tuple[float, float] | None = None,
 ) -> None:
     player_ids: set[EntityID] = set()
     for entity_id, (_tag,) in ecs.iter_entities(PlayerTag):
@@ -221,10 +225,14 @@ def update_agent_wander(
             kind_code = KIND_CIVILIAN
             arch_code = ARCH_ROOM
             pressure_bias = 0.0
+            response_mode = "ambient"
+            response_strength = 0.0
             if agent_state is not None:
                 kind_code = _kind_code(agent_state.kind)
                 arch_code = _arch_code(agent_state.home_archetype)
                 pressure_bias = agent_state.pressure_bias
+                response_mode = agent_state.response_mode
+                response_strength = agent_state.response_strength
 
             wander_state[entity_id] = {
                 "timer": random.uniform(turn_interval_min, turn_interval_max),
@@ -233,6 +241,8 @@ def update_agent_wander(
                 "kind_code": kind_code,
                 "arch_code": arch_code,
                 "pressure_bias": pressure_bias,
+                "response_mode": response_mode,
+                "response_strength": response_strength,
             }
 
     stale = [entity_id for entity_id in wander_state if not world.has(entity_id)]
@@ -247,16 +257,29 @@ def update_agent_wander(
 
         idx = world.entity_to_index[entity_id]
         state = wander_state[entity_id]
+        agent_state = ecs.get_component(entity_id, AgentState)
+
+        if agent_state is not None:
+            state["kind_code"] = _kind_code(agent_state.kind)
+            state["arch_code"] = _arch_code(agent_state.home_archetype)
+            state["pressure_bias"] = agent_state.pressure_bias
+            state["response_mode"] = agent_state.response_mode
+            state["response_strength"] = agent_state.response_strength
 
         kind_code = int(state["kind_code"])
         arch_code = int(state["arch_code"])
         pressure_bias = float(state["pressure_bias"])
+        response_mode = str(state.get("response_mode", "ambient"))
+        response_strength = float(state.get("response_strength", 0.0))
 
         speed, jitter, avoid_margin, obstacle_push, bounds_push = _behavior_profile_codes(
             kind_code,
             arch_code,
             pressure_bias,
         )
+
+        if kind_code == KIND_HOSTILE and response_mode != "ambient":
+            speed *= 1.0 + 0.25 * response_strength
 
         timer = float(state["timer"]) - dt
         dx = float(state["dir_x"])
@@ -289,6 +312,17 @@ def update_agent_wander(
             dx += random.uniform(-0.05, 0.05)
             dy += random.uniform(-0.05, 0.05)
             break
+
+        if player_pos is not None and kind_code == KIND_HOSTILE and response_mode != "ambient":
+            tx = player_pos[0] - px
+            ty = player_pos[1] - py
+            hx, hy = _normalize(tx, ty)
+            bias = 1.8 * response_strength
+            if response_mode == "seized_response":
+                bias *= 1.20
+            dx += hx * bias
+            dy += hy * bias
+            timer = min(timer, 0.12)
 
         dx, dy = _normalize(dx, dy)
 

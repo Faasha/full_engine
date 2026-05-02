@@ -47,24 +47,6 @@ from engine.systems.flat_sync_system import build_flat_world_from_ecs, write_fla
 from engine.systems.player_input_system import apply_player_input
 from engine.systems.simple_collision_system import RectObstacle, WorldBounds, resolve_static_obstacles, resolve_world_bounds
 from engine.world.district_state import DistrictState, pressure_to_district_state
-from engine.world.district_roles import assign_district_role
-from engine.world.doctrine_runtime import (
-    active_pressure_summary,
-    apply_background_drift,
-    average_live_speeds,
-    build_chunk_overlay,
-    build_chunk_telemetry,
-    build_doctrine_snapshot,
-    build_state_counts,
-    count_active_abstract_population,
-    count_explicit_population,
-    most_activated_chunks,
-    rehydrate_active_chunk_population,
-    top_civilian_loss,
-    top_hostile_growth,
-    top_pressure_chunks,
-    update_district_states,
-)
 from engine.world.save_manager import load_chunk_state_into, save_chunk_state
 from engine.world.run_report import save_run_report
 from engine.world.live_run_state import save_live_run_state, clear_live_run_state
@@ -72,6 +54,17 @@ from engine.missions.mission import Mission, build_default_mission
 
 
 EntityID = Tuple[int, int]
+
+
+@dataclass(slots=True)
+class ChunkTelemetry:
+    baseline_civ: float
+    baseline_host: float
+    final_civ: float
+    final_host: float
+    final_pressure: float
+    activation_count: int
+    archetype: str
 
 
 def _poll_keys_pygame() -> dict[str, bool]:
@@ -127,7 +120,6 @@ def _make_world_chunks(grid: WorldGrid) -> Dict[ChunkCoord, WorldChunk]:
                 civilians = 3.0
                 hostiles = 1.0
 
-            role = assign_district_role((cx, cy), archetype)
             ox, oy = grid.chunk_to_world_origin((cx, cy))
             chunks[(cx, cy)] = make_room_chunk(
                 (cx, cy),
@@ -141,7 +133,6 @@ def _make_world_chunks(grid: WorldGrid) -> Dict[ChunkCoord, WorldChunk]:
                 seed=(cx * 73856093) ^ (cy * 19349663),
                 tag=tag,
                 archetype=archetype,
-                district_role=role,
             )
 
     return chunks
@@ -596,15 +587,9 @@ def _autopilot_keys(
     mission: Mission,
 ) -> dict[str, bool]:
     current = grid.world_to_chunk(player_x, player_y)
+    target = mission.target if mission.picked_up else mission.source
 
-    # Once the objective has been delivered, leave the danger zone.
-    # Without this, probe/autopilot runs camp the completed target until
-    # duration ends, inflating pressure after a successful mission.
-    if mission.delivered:
-        target = (0, 0)
-    else:
-        target = mission.target if mission.picked_up else mission.source
-
+    # Stop only when we are already inside the objective chunk.
     if current == target:
         return {
             "left": False,
@@ -617,46 +602,18 @@ def _autopilot_keys(
 
     def neighbors(coord: ChunkCoord) -> list[ChunkCoord]:
         x, y = coord
-        dx = target[0] - x
-        dy = target[1] - y
-
-        preferred: list[tuple[int, int]] = []
-
-        if abs(dy) >= abs(dx):
-            if dy > 0:
-                preferred.append((x, y + 1))
-            elif dy < 0:
-                preferred.append((x, y - 1))
-
-            if dx > 0:
-                preferred.append((x + 1, y))
-            elif dx < 0:
-                preferred.append((x - 1, y))
-        else:
-            if dx > 0:
-                preferred.append((x + 1, y))
-            elif dx < 0:
-                preferred.append((x - 1, y))
-
-            if dy > 0:
-                preferred.append((x, y + 1))
-            elif dy < 0:
-                preferred.append((x, y - 1))
-
-        fallback = [
+        out: list[ChunkCoord] = []
+        for nxt in (
             (x + 1, y),
             (x - 1, y),
             (x, y + 1),
             (x, y - 1),
-        ]
+        ):
+            if nxt in defined:
+                out.append(nxt)
+        return out
 
-        ordered: list[ChunkCoord] = []
-        for nxt in preferred + fallback:
-            if nxt in defined and nxt not in ordered:
-                ordered.append(nxt)
-
-        return ordered
-
+    # BFS over chunk adjacency.
     frontier: list[ChunkCoord] = [current]
     came_from: dict[ChunkCoord, ChunkCoord | None] = {current: None}
     head = 0
@@ -685,46 +642,24 @@ def _autopilot_keys(
     next_cx = next_ox + grid.chunk_width * 0.5
     next_cy = next_oy + grid.chunk_height * 0.5
 
-    target_ox, target_oy = grid.chunk_to_world_origin(target)
-    target_cx = target_ox + grid.chunk_width * 0.5
-    target_cy = target_oy + grid.chunk_height * 0.5
-
-    current_chunk = chunks.get(current)
-    current_archetype = current_chunk.archetype if current_chunk is not None else "room"
-
-    moving_horizontal = next_chunk[0] != current[0]
-    moving_vertical = next_chunk[1] != current[1]
-
-    # Default: aim inside the next chunk.
-    tx = next_cx
-    ty = next_cy
-
-    if moving_horizontal:
-        if next_chunk[0] > current[0]:
-            tx = next_ox + margin
-        else:
-            tx = next_ox + grid.chunk_width - margin
-
-        # Lane chunks have a central vertical blocker.
-        # Crossing left/right through the center stalls on it, so bias the route
-        # through the upper or lower corridor based on the final target's y.
-        if current_archetype == "lane":
-            if target_cy < player_y:
-                ty = next_oy + margin
-            elif target_cy > player_y:
-                ty = next_oy + grid.chunk_height - margin
-            else:
-                ty = next_cy
-        else:
-            ty = next_cy
-
-    elif moving_vertical:
-        if next_chunk[1] > current[1]:
-            ty = next_oy + margin
-        else:
-            ty = next_oy + grid.chunk_height - margin
-
+    # Important:
+    # Aim INSIDE the next chunk, not at the current chunk's doorway edge.
+    # The old version dead-zoned before actually crossing chunk boundaries.
+    if next_chunk[0] > current[0]:
+        tx = next_ox + margin
+        ty = next_cy
+    elif next_chunk[0] < current[0]:
+        tx = next_ox + grid.chunk_width - margin
+        ty = next_cy
+    elif next_chunk[1] > current[1]:
         tx = next_cx
+        ty = next_oy + margin
+    elif next_chunk[1] < current[1]:
+        tx = next_cx
+        ty = next_oy + grid.chunk_height - margin
+    else:
+        tx = next_cx
+        ty = next_cy
 
     dx = tx - player_x
     dy = ty - player_y
@@ -750,7 +685,6 @@ def run_world_slice(
     active_radius: int = 1,
     warm_radius: int = 2,
     debug_level: str = "basic",
-    load_path: str | None = None,
     save_path: str = "runtime/world_state.json",
     report_path: str | None = "runtime/last_run_report.json",
     live_state_path: str | None = "runtime/live_run_state.json",
@@ -774,8 +708,7 @@ def run_world_slice(
     for chunk in chunks.values():
         chunk.district_state = pressure_to_district_state(chunk.state.pressure).value
 
-    effective_load_path = load_path if load_path is not None else save_path
-    loaded_chunk_count = load_chunk_state_into(chunks, effective_load_path)
+    loaded_chunk_count = load_chunk_state_into(chunks, save_path)
     for chunk in chunks.values():
         chunk.district_state = pressure_to_district_state(chunk.state.pressure).value
 
@@ -908,6 +841,96 @@ def run_world_slice(
         build_flat_world_from_ecs(ecs, world)
         wander_state = build_wander_state(world, ecs)
 
+    def _apply_background_drift() -> None:
+        for coord, chunk in chunks.items():
+            if coord not in activation.warm_chunks:
+                chunk.apply_passive_drift()
+
+    def _update_district_states() -> list[str]:
+        changes: list[str] = []
+        for coord, chunk in chunks.items():
+            prev = chunk.district_state
+            curr = pressure_to_district_state(chunk.state.pressure).value
+            if curr != prev:
+                chunk.district_state = curr
+                changes.append(f"{coord}:{prev}->{curr}")
+            else:
+                chunk.district_state = curr
+        return changes
+
+    def _count_explicit_population() -> tuple[int, int]:
+        civ = 0
+        host = 0
+        for entity_id in world.index_to_entity:
+            if entity_id == player_id:
+                continue
+            agent_state = ecs.get_component(entity_id, AgentState)
+            if agent_state is None:
+                continue
+            if agent_state.kind == "hostile":
+                host += 1
+            else:
+                civ += 1
+        return civ, host
+
+    def _count_active_abstract_population() -> tuple[int, int]:
+        civ = 0
+        host = 0
+        for coord in activation.active_chunks:
+            chunk = chunks.get(coord)
+            if chunk is None:
+                continue
+            civ += chunk.civilian_count_hint()
+            host += chunk.hostile_count_hint()
+        return civ, host
+
+    def _average_live_speeds() -> tuple[float, float]:
+        civ_total = 0.0
+        civ_count = 0
+        host_total = 0.0
+        host_count = 0
+
+        for entity_id in world.index_to_entity:
+            if entity_id == player_id:
+                continue
+            agent_state = ecs.get_component(entity_id, AgentState)
+            if agent_state is None:
+                continue
+            idx = world.entity_to_index[entity_id]
+            vx = world.vel_x[idx]
+            vy = world.vel_y[idx]
+            speed = (vx * vx + vy * vy) ** 0.5
+
+            if agent_state.kind == "hostile":
+                host_total += speed
+                host_count += 1
+            else:
+                civ_total += speed
+                civ_count += 1
+
+        civ_avg = civ_total / civ_count if civ_count else 0.0
+        host_avg = host_total / host_count if host_count else 0.0
+        return civ_avg, host_avg
+
+    def _build_chunk_overlay() -> list[dict[str, object]]:
+        overlay: list[dict[str, object]] = []
+        for coord, chunk in chunks.items():
+            x0, y0, x1, y1 = grid.chunk_bounds(coord)
+            overlay.append(
+                {
+                    "coord": coord,
+                    "x": x0,
+                    "y": y0,
+                    "w": x1 - x0,
+                    "h": y1 - y0,
+                    "pressure": float(chunk.state.pressure),
+                    "active": coord in activation.active_chunks,
+                    "archetype": chunk.archetype,
+                    "district_state": chunk.district_state,
+                }
+            )
+        return overlay
+
     def update_fn(tick: int, dt: float) -> None:
         nonlocal tick_count, tick_total, tick_max
         nonlocal last_live_state_second
@@ -1034,7 +1057,7 @@ def run_world_slice(
         if active_mission.picked_up and not active_mission.delivered:
             cached_objective_text = "Deliver to safe district"
         elif active_mission.delivered:
-            cached_objective_text = "Return to hub"
+            cached_objective_text = "Stay alive until run ends"
         else:
             cached_objective_text = "Reach pickup"
 
@@ -1106,9 +1129,9 @@ def run_world_slice(
                 total_spawned += len(entity_ids)
                 runtime_changed = True
 
-        apply_background_drift(chunks, activation.warm_chunks)
+        _apply_background_drift()
 
-        state_changes = update_district_states(chunks)
+        state_changes = _update_district_states()
         if state_changes:
             district_transition_count += len(state_changes)
             cached_last_state_changes = state_changes[:3]
@@ -1159,8 +1182,8 @@ def run_world_slice(
         if current_second != last_trace_second:
             last_trace_second = current_second
             dbg = chunk_sets_debug_dict(activation)
-            explicit_civ, explicit_host = count_explicit_population(world, ecs, player_id)
-            abstract_civ, abstract_host = count_active_abstract_population(chunks, activation.active_chunks)
+            explicit_civ, explicit_host = _count_explicit_population()
+            abstract_civ, abstract_host = _count_active_abstract_population()
             pressure_total = 0.0
             for coord in activation.active_chunks:
                 chunk = chunks.get(coord)
@@ -1180,7 +1203,7 @@ def run_world_slice(
             )
 
         if debug_level == "full" and tick % speed_sample_interval == 0:
-            cached_civ_avg_speed, cached_host_avg_speed = average_live_speeds(world, ecs, player_id)
+            cached_civ_avg_speed, cached_host_avg_speed = _average_live_speeds()
 
         packet = packet_pool.acquire()
         extract_start = time.perf_counter()
@@ -1211,7 +1234,7 @@ def run_world_slice(
         }
 
         if debug_level in {"basic", "full"}:
-            packet["chunk_overlay"] = build_chunk_overlay(chunks, grid, activation.active_chunks)
+            packet["chunk_overlay"] = _build_chunk_overlay()
         else:
             packet["chunk_overlay"] = []
 
@@ -1277,27 +1300,32 @@ def run_world_slice(
     if live_state_path is not None:
         clear_live_run_state(live_state_path)
 
-    rehydrate_active_chunk_population(chunks, chunk_entities, ecs)
+    # Rehydrate any still-active chunk populations before saving.
+    # current_channels is the abstract reserve after materialization,
+    # so if we save while agents are still live in ECS, the save will hollow the city out.
+    for coord, entity_ids in chunk_entities.items():
+        chunk = chunks.get(coord)
+        if chunk is None:
+            continue
 
-    mission_aftermath = {
-        "applied": False,
-        "mission_type": cached_mission_label,
-        "cargo_type": cached_mission_cargo,
-        "affected_chunks": [],
-        "pressure_delta_total": 0.0,
-        "civilians_delta_total": 0.0,
-        "hostiles_delta_total": 0.0,
-        "notes": [],
-    }
+        returned_civ = 0
+        returned_host = 0
 
-    active_mission.finalize(overloaded=cached_player_overloaded)
-    if active_mission.completed and not active_mission.failed:
-        mission_aftermath = active_mission.apply_aftermath(chunks)
-        for chunk in chunks.values():
-            chunk.district_state = pressure_to_district_state(chunk.state.pressure).value
+        for entity_id in entity_ids:
+            agent_state = ecs.get_component(entity_id, AgentState)
+            if agent_state is None:
+                continue
+            if agent_state.kind == "hostile":
+                returned_host += 1
+            else:
+                returned_civ += 1
+
+        if returned_civ or returned_host:
+            chunk.note_population_returned(returned_civ, returned_host)
 
     save_chunk_state(chunks, save_path)
 
+    active_mission.finalize(overloaded=cached_player_overloaded)
     cached_mission_phase = active_mission.phase
     cached_mission_completed = active_mission.completed
     cached_mission_failed = active_mission.failed
@@ -1306,29 +1334,42 @@ def run_world_slice(
     dbg = chunk_sets_debug_dict(activation)
     defined_final = sum(1 for coord in activation.active_chunks if coord in chunks)
 
-    final_explicit_civ, final_explicit_host = count_explicit_population(world, ecs, player_id)
-    final_abstract_civ, final_abstract_host = count_active_abstract_population(chunks, activation.active_chunks)
+    final_explicit_civ, final_explicit_host = _count_explicit_population()
+    final_abstract_civ, final_abstract_host = _count_active_abstract_population()
 
     final_civ_avg_speed = 0.0
     final_host_avg_speed = 0.0
     if debug_level == "full":
-        final_civ_avg_speed, final_host_avg_speed = average_live_speeds(world, ecs, player_id)
+        final_civ_avg_speed, final_host_avg_speed = _average_live_speeds()
 
-    final_pressure, archetypes_in_active = active_pressure_summary(chunks, activation.active_chunks)
+    final_pressure = 0.0
+    archetypes_in_active: Dict[str, int] = {}
+    for coord in activation.active_chunks:
+        chunk = chunks.get(coord)
+        if chunk is None:
+            continue
+        final_pressure += chunk.state.pressure
+        archetypes_in_active[chunk.archetype] = archetypes_in_active.get(chunk.archetype, 0) + 1
 
-    snapshot = build_doctrine_snapshot(
-        chunks=chunks,
-        active_chunks=activation.active_chunks,
-        chunk_telemetry_start=chunk_telemetry_start,
-    )
-    total_pressure = snapshot["world_pressure_total"]
-    final_pressure = snapshot["active_pressure"]
-    archetypes_in_active = snapshot["active_archetypes"]
-    state_counts = snapshot["district_state_counts"]
-    hottest = snapshot["top_pressure_chunks"]
-    hostile_growth = snapshot["top_hostile_growth"]
-    civilian_loss = snapshot["top_civilian_loss"]
-    most_activated = snapshot["most_activated_chunks"]
+    total_pressure = sum(chunk.state.pressure for chunk in chunks.values())
+
+    telemetry: Dict[ChunkCoord, ChunkTelemetry] = {}
+    for coord, chunk in chunks.items():
+        baseline_civ, baseline_host = chunk_telemetry_start[coord]
+        telemetry[coord] = ChunkTelemetry(
+            baseline_civ=baseline_civ,
+            baseline_host=baseline_host,
+            final_civ=chunk.state.current_channels.civilians,
+            final_host=chunk.state.current_channels.hostiles,
+            final_pressure=chunk.state.pressure,
+            activation_count=chunk.state.activation_count,
+            archetype=chunk.archetype,
+        )
+
+    hottest = sorted(telemetry.items(), key=lambda item: item[1].final_pressure, reverse=True)[:5]
+    hostile_growth = sorted(telemetry.items(), key=lambda item: item[1].final_host - item[1].baseline_host, reverse=True)[:5]
+    civilian_loss = sorted(telemetry.items(), key=lambda item: item[1].baseline_civ - item[1].final_civ, reverse=True)[:5]
+    most_activated = sorted(telemetry.items(), key=lambda item: item[1].activation_count, reverse=True)[:5]
 
     print("=== World Slice Timing Summary ===")
     print(f"ticks: {tick_count}")
@@ -1382,6 +1423,9 @@ def run_world_slice(
         print(f"avg civilian speed: {final_civ_avg_speed:.3f}")
         print(f"avg hostile speed: {final_host_avg_speed:.3f}")
 
+    state_counts: Dict[str, int] = {}
+    for chunk in chunks.values():
+        state_counts[chunk.district_state] = state_counts.get(chunk.district_state, 0) + 1
 
     print("=== Mission Summary ===")
     print(f"mission label: {cached_mission_label}")
@@ -1392,7 +1436,6 @@ def run_world_slice(
     print(f"mission completed: {cached_mission_completed}")
     print(f"mission failed: {cached_mission_failed}")
     print(f"mission failure reason: {cached_mission_failure_reason or 'none'}")
-    print("mission aftermath:", mission_aftermath)
 
     print("=== World Slice Persistent Summary ===")
     print(f"world pressure total: {total_pressure:.2f}")
@@ -1452,7 +1495,6 @@ def run_world_slice(
                 "completed": cached_mission_completed,
                 "failed": cached_mission_failed,
                 "failure_reason": cached_mission_failure_reason or "none",
-                "aftermath": mission_aftermath,
             },
             "player": {
                 "zone_archetype": cached_player_archetype,

@@ -48,6 +48,8 @@ class PersistentChunkState:
     pressure: float = 0.0
     last_active_tick: int = -1
     activation_count: int = 0
+    anchor_strength: float = 0.0
+    anchor_certified: bool = False
 
     def total(self) -> float:
         return self.current_channels.total()
@@ -58,10 +60,12 @@ class WorldChunk:
     coord: ChunkCoord
     archetype: str = "wild"
     district_state: str = "clear"
+    district_role: str = "wild"
     obstacles: List[RectObstacle] = field(default_factory=list)
     population: PopulationAnchor = field(default_factory=PopulationAnchor)
     state: PersistentChunkState = field(default_factory=PersistentChunkState)
     tag: str = "wild"
+    door_mask: str = ""
 
     def has_obstacles(self) -> bool:
         return bool(self.obstacles)
@@ -84,6 +88,8 @@ class WorldChunk:
             pressure=0.0,
             last_active_tick=-1,
             activation_count=0,
+            anchor_strength=0.0,
+            anchor_certified=False,
         )
 
     def on_activate(self, tick: int) -> None:
@@ -342,6 +348,7 @@ def make_room_chunk(
     seed: int = 0,
     tag: str = "room",
     archetype: str = "room",
+    district_role: str = "wild",
 ) -> WorldChunk:
     obstacles = _build_outer_walls(
         origin_x=origin_x,
@@ -364,6 +371,7 @@ def make_room_chunk(
     return WorldChunk(
         coord=coord,
         archetype=archetype,
+        district_role=district_role,
         obstacles=obstacles,
         population=PopulationAnchor(channels=channels.copy(), seed=seed),
         state=PersistentChunkState(
@@ -371,6 +379,9 @@ def make_room_chunk(
             pressure=0.0,
             last_active_tick=-1,
             activation_count=0,
+            anchor_strength=0.0,
+            anchor_certified=False,
         ),
         tag=tag,
+        door_mask=door_mask,
     )
